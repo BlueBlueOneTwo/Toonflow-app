@@ -9,7 +9,7 @@
 | 决策项 | 选择 | 说明 |
 |--------|------|------|
 | 数据库 | **PostgreSQL** | 多租户、高并发写入、事务支持更强 |
-| 文件存储 | **统一 OSS** | 阿里云 OSS，所有文件（图片/视频/素材）统一管理 |
+| 文件存储 | **统一 OSS（腾讯云 COS）** | 国内节点，CDN 加速，SDK 成熟 |
 | 任务队列 | **抽象层设计** | 短期：BullMQ + Redis；长期：Kafka / Pulsar，接口隔离预留切换空间 |
 | 前端 | **全新设计** | 科技感 + 高体验要求，基于 UI 设计最佳实践重新设计 |
 | 部署 | 东南亚优先 | 暂定东南亚（延迟低、成本低、覆盖广）|
@@ -74,9 +74,15 @@
  └──────┘
     │
     ▼
- ┌──────────────────┐
+ ┌────────────────┐
  │   任务队列抽象层   │◄──────── 短期: BullMQ + Redis
- │ TaskQueueAdapter  │          长期: Kafka / Pulsar
+ │ TaskQueueAdapter │          长期: Kafka / Pulsar
+ └────────────────┘
+        │
+        ▼
+ ┌──────────────────┐
+ │  腾讯云 COS (OSS) │
+ │  (统一文件存储)   │
  └──────────────────┘
 ```
 
@@ -333,12 +339,26 @@ CREATE TABLE t_tasks (
 | 字幕文件 | `/subtitles/{projectId}/` | `/subtitles/456/episode_01.srt` |
 | 临时文件 | `/temp/{userId}/` | `/temp/123/frame_001.jpg`（24h 自动清理）|
 
-### 上传流程
+### 上传流程（腾讯云 COS）
 
 ```typescript
-// src/services/storage/OssUploader.ts
+// src/services/storage/CosUploader.ts
+// 使用腾讯云 COS SDK (cos-nodejs-sdk-v5)
 
-export class OssUploader {
+import COS from 'cos-nodejs-sdk-v5';
+
+export class CosUploader {
+  private cos: COS;
+
+  constructor() {
+    this.cos = new COS({
+      SecretId: process.env.TENCENT_SECRET_ID,
+      SecretKey: process.env.TENCENT_SECRET_KEY,
+      Bucket: process.env.TENCENT_BUCKET,
+      Region: process.env.TENCENT_REGION  // 如 'ap-shanghai'
+    });
+  }
+
   // 统一上传接口，支持断点续传
   async upload(file: Buffer, key: string, options?: {
     contentType?: string;
@@ -346,17 +366,17 @@ export class OssUploader {
   }): Promise<string> {
     // 1. 验证文件大小
     // 2. 生成唯一文件名（UUID）
-    // 3. 上传到 OSS
-    // 4. 返回访问 URL
+    // 3. 上传到 COS
+    // 4. 返回访问 URL（COS 自带 CDN 加速）
   }
 
-  // 生成签名 URL（私有文件访问）
+  // 生成签名 URL（私有文件访问，有效期可调）
   async signedUrl(key: string, expiresIn: number = 3600): Promise<string>;
 
   // 删除文件
   async delete(key: string): Promise<void>;
 
-  // 清理临时文件（定时任务）
+  // 清理临时文件（定时任务，Node cron）
   async cleanupTemp(olderThanHours: number = 24): Promise<void>;
 }
 ```
