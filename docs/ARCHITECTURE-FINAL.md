@@ -9,7 +9,7 @@
 | 决策项 | 选择 | 说明 |
 |--------|------|------|
 | 数据库 | **PostgreSQL** | 多租户、高并发写入、事务支持更强 |
-| 文件存储 | **统一 OSS（腾讯云 COS）** | 国内节点，CDN 加速，SDK 成熟 |
+| 文件存储 | **多云存储抽象层**（腾讯 COS 优先 + AWS S3 + 阿里 OSS）| 支持多厂商，按配置切换 |
 | 任务队列 | **抽象层设计** | 短期：BullMQ + Redis；长期：Kafka / Pulsar，接口隔离预留切换空间 |
 | 前端 | **全新设计** | 科技感 + 高体验要求，基于 UI 设计最佳实践重新设计 |
 | 部署 | 东南亚优先 | 暂定东南亚（延迟低、成本低、覆盖广）|
@@ -339,47 +339,62 @@ CREATE TABLE t_tasks (
 | 字幕文件 | `/subtitles/{projectId}/` | `/subtitles/456/episode_01.srt` |
 | 临时文件 | `/temp/{userId}/` | `/temp/123/frame_001.jpg`（24h 自动清理）|
 
-### 上传流程（腾讯云 COS）
+### 存储抽象层（多云支持）
+
+同样采用 Adapter 模式，配置驱动切换：
 
 ```typescript
-// src/services/storage/CosUploader.ts
-// 使用腾讯云 COS SDK (cos-nodejs-sdk-v5)
+// src/services/storage/interfaces/IStorageAdapter.ts
 
-import COS from 'cos-nodejs-sdk-v5';
+export interface IStorageAdapter {
+  init(): Promise<void>;
+  upload(file: Buffer, key: string, options?: UploadOptions): Promise<string>;
+  signedUrl(key: string, expiresIn?: number): Promise<string>;
+  delete(key: string): Promise<void>;
+  cleanupTemp(olderThanHours: number): Promise<void>;
+  health(): Promise<boolean>;
+}
 
-export class CosUploader {
-  private cos: COS;
+export interface UploadOptions {
+  contentType?: string;
+  maxSizeMB?: number;
+}
 
-  constructor() {
-    this.cos = new COS({
+// src/services/storage/adapters/ - 三个厂商实现
+
+ TencentCosAdapter  ──► use Tencent Cloud COS SDK (cos-nodejs-sdk-v5)
+ AwsS3Adapter        ──► use AWS SDK (@aws-sdk/client-s3)
+ AliyunOssAdapter    ──► use Aliyun OSS SDK (ali-oss)
+
+// 业务代码完全不感知底层厂商，配置切换：
+
+// config/storage.ts
+export const storageConfig = {
+  provider: process.env.STORAGE_PROVIDER,  // 'tencent' | 'aws' | 'aliyun'
+  providers: {
+    tencent: {
       SecretId: process.env.TENCENT_SECRET_ID,
       SecretKey: process.env.TENCENT_SECRET_KEY,
       Bucket: process.env.TENCENT_BUCKET,
-      Region: process.env.TENCENT_REGION  // 如 'ap-shanghai'
-    });
+      Region: process.env.TENCENT_REGION
+    },
+    aws: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      bucket: process.env.AWS_S3_BUCKET,
+      region: process.env.AWS_REGION
+    },
+    aliyun: {
+      accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID,
+      secretAccessKey: process.env.ALIYUN_SECRET_ACCESS_KEY,
+      bucket: process.env.ALIYUN_OSS_BUCKET,
+      region: process.env.ALIYUN_REGION
+    }
   }
-
-  // 统一上传接口，支持断点续传
-  async upload(file: Buffer, key: string, options?: {
-    contentType?: string;
-    maxSize?: number;  // MB，默认 100MB
-  }): Promise<string> {
-    // 1. 验证文件大小
-    // 2. 生成唯一文件名（UUID）
-    // 3. 上传到 COS
-    // 4. 返回访问 URL（COS 自带 CDN 加速）
-  }
-
-  // 生成签名 URL（私有文件访问，有效期可调）
-  async signedUrl(key: string, expiresIn: number = 3600): Promise<string>;
-
-  // 删除文件
-  async delete(key: string): Promise<void>;
-
-  // 清理临时文件（定时任务，Node cron）
-  async cleanupTemp(olderThanHours: number = 24): Promise<void>;
-}
+};
 ```
+
+所有文件统一前缀管理，切换云厂商时只需修改 `STORAGE_PROVIDER` 环境变量，上传的文件路径格式完全不变。
 
 ---
 
