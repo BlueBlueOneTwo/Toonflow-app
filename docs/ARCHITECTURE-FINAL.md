@@ -413,22 +413,38 @@ export const storageConfig = {
 
 ---
 
-## 七、AI 模型扩展计划
+## 七、AI 模型扩展计划（多厂商抽象）
 
-### 当前已接入（可直接复用）
-- LLM：Gemini / Claude / GPT-4 / DeepSeek / XAI（`ai` SDK）
-- 视频：Sora（OpenAI）
+所有 AI 模型调用采用 Adapter 模式，厂商切换时业务代码零改动：
 
-### 新增接入计划
-| 模型 | 类型 | 优先级 | 用途 |
-|------|------|--------|------|
-| 豆包（字节）| LLM + 视频 | P0 | 文本理解 + 视频生成 |
-| Seedance 2.0 | 视频 | P0 | 主力视频生成 |
-| OpenRouter | 聚合平台 | P0 | 统一接入多模型，按需切换 |
-| Together.ai | 聚合平台 | P1 | 同上 |
-| Seedream | 图片 | P1 | 角色/分镜图生成 |
-| 可灵 | 视频 | P1 | 备选视频生成 |
-| 火山引擎 TTS | 音频 | P1 | AI 配音 |
+```typescript
+// src/services/ai/interfaces/IModelAdapter.ts
+
+export interface IModelAdapter {
+  init(): Promise<void>;
+  call(prompt: string, options?: CallOptions): Promise<ModelOutput>;
+  health(): Promise<boolean>;
+  getCapabilities(): string[];
+  getCostPerCall(): number;
+}
+
+// src/services/ai/adapters/
+  GoogleGeminiAdapter   ──► Google AI SDK
+  ByteDanceAdapter    ──► 豆包/火山引擎 API（LLM + TTS + 视频）
+  SeedanceAdapter     ──► Seedance 2.0 API
+  OpenRouterAdapter   ──► OpenRouter 聚合平台
+  TogetherAdapter     ──► Together.ai 聚合平台
+  SoraAdapter         ──► OpenAI Sora
+  AwsBedrockAdapter   ──► AWS Bedrock（Claude/GPT via AWS）
+  AliyunDashscopeAdapter──► 阿里云通义千问/视频合成
+```
+
+配置示例（环境变量或管理后台）：
+```
+AI_PROVIDER_PRIORITY=bytedance,openrouter,aws  # 视频优先豆包，备选聚合平台
+GEMINI_PROVIDER=google
+TTS_PROVIDER=bytedance  # 配音用火山引擎
+```
 
 ---
 
