@@ -1336,3 +1336,967 @@ module:billing AND level:WARN
 ---
 
 *本文档持续更新中*
+
+---
+
+## 十四、API 详细设计
+
+### 14.1 API 设计规范
+
+**基础约定**：
+- 协议：HTTPS + JSON
+- 认证：Bearer Token（JWT），有效期 24h
+- 语言：简体中文（错误消息支持中英双语）
+- 分页：cursor-based 或 page-based，默认 page=1, pageSize=20
+
+**通用响应格式**：
+```typescript
+// 成功
+{
+  "code": 0,
+  "message": "操作成功",
+  "data": { ... },
+  "requestId": "req_abc123",
+  "timestamp": "2026-03-30T14:30:00.000Z"
+}
+
+// 错误
+{
+  "code": 10001,       // 业务错误码（见 14.2）
+  "message": "积分不足",
+  "requestId": "req_abc123",
+  "timestamp": "2026-03-30T14:30:00.000Z",
+  "data": {
+    "required": 50,
+    "balance": 20,
+    "rechargeUrl": "/credits/purchase"
+  }
+}
+```
+
+**错误码规范**：
+```
+0      - 成功
+10001  - 参数错误
+10002  - 未登录
+10003  - 无权限
+20001  - 资源不存在
+20002  - 资源已存在
+30001  - 积分不足
+30002  - 套餐权限不足
+40001  - AI 模型调用失败
+40002  - 任务不存在
+40003  - 任务已取消
+40004  - 任务执行中
+50001  - 系统内部错误
+50002  - 服务不可用
+```
+
+---
+
+### 14.2 认证相关 API
+
+#### POST /auth/register（邮箱注册）
+
+Request：
+```json
+{
+  "email": "user@example.com",
+  "password": "Aa123456!",
+  "captchaToken": "captcha_from_verify"
+}
+```
+
+Response（成功，201）：
+```json
+{
+  "code": 0,
+  "message": "注册成功",
+  "data": {
+    "userId": 42,
+    "email": "user@example.com",
+    "plan": "free",
+    "accessToken": "eyJhbG...",
+    "refreshToken": "eyJhbG..."
+  }
+}
+```
+
+错误响应：
+```json
+// 邮箱已被注册（409）
+{
+  "code": 20002,
+  "message": "该邮箱已被注册"
+}
+
+// 密码太弱（400）
+{
+  "code": 10001,
+  "message": "密码需包含字母和数字，至少8位"
+}
+```
+
+---
+
+#### POST /auth/login（邮箱登录）
+
+Request：
+```json
+{
+  "email": "user@example.com",
+  "password": "Aa123456!"
+}
+```
+
+Response（成功，200）：
+```json
+{
+  "code": 0,
+  "message": "登录成功",
+  "data": {
+    "userId": 42,
+    "email": "user@example.com",
+    "plan": "creator",
+    "balance": 500,
+    "accessToken": "eyJhbG...",
+    "refreshToken": "eyJhbG...",
+    "expiresIn": 86400
+  }
+}
+```
+
+---
+
+#### POST /auth/wechat（微信登录）
+
+Request：
+```json
+{
+  "code": "微信授权code"
+}
+```
+
+Response（成功，200）：
+```json
+{
+  "code": 0,
+  "message": "登录成功",
+  "data": {
+    "userId": 42,
+    "openid": "wx_openid_xxx",
+    "newUser": false,
+    "accessToken": "eyJhbG...",
+    "refreshToken": "eyJhbG..."
+  }
+}
+```
+
+---
+
+#### POST /auth/refresh（刷新 Token）
+
+Request：
+```json
+{
+  "refreshToken": "eyJhbG..."
+}
+```
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "accessToken": "eyJhbG...",
+    "expiresIn": 86400
+  }
+}
+```
+
+---
+
+#### GET /auth/me（获取当前用户）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "userId": 42,
+    "email": "user@example.com",
+    "phone": "138****8888",
+    "plan": "creator",
+    "planName": "创作档",
+    "credits": 485,
+    "subscription": {
+      "startedAt": "2026-03-01T00:00:00Z",
+      "expiresAt": "2026-04-01T00:00:00Z",
+      "autoRenew": true
+    },
+    "createdAt": "2026-03-15T10:00:00Z"
+  }
+}
+```
+
+---
+
+### 14.3 订阅与积分 API
+
+#### GET /subscription/plans（获取套餐列表）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "plans": [
+      {
+        "id": 1,
+        "name": "free",
+        "displayName": "免费档",
+        "price": 0,
+        "creditsPerMonth": 2,
+        "features": {
+          "watermark": true,
+          "resolutions": ["720p"],
+          "batch": false,
+          "tts": false
+        },
+        "isCurrent": false
+      },
+      {
+        "id": 2,
+        "name": "creator",
+        "displayName": "创作档",
+        "price": 99,
+        "creditsPerMonth": 500,
+        "features": {
+          "watermark": false,
+          "resolutions": ["720p", "1080p"],
+          "batch": false,
+          "tts": true
+        },
+        "isCurrent": true
+      },
+      {
+        "id": 3,
+        "name": "pro",
+        "displayName": "专业档",
+        "price": 299,
+        "creditsPerMonth": 1500,
+        "features": {
+          "watermark": false,
+          "resolutions": ["720p", "1080p"],
+          "batch": true,
+          "tts": true
+        },
+        "isCurrent": false
+      },
+      {
+        "id": 4,
+        "name": "enterprise",
+        "displayName": "企业档",
+        "price": null,
+        "creditsPerMonth": null,
+        "features": {
+          "watermark": false,
+          "resolutions": ["720p", "1080p", "4k"],
+          "batch": true,
+          "tts": true,
+          "apiAccess": true
+        },
+        "contactSales": true
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### POST /subscription/subscribe（购买订阅）
+
+Request：
+```json
+{
+  "planId": 2,
+  "gateway": "wechat",  // 'wechat' | 'alipay'
+  "autoRenew": true
+}
+```
+
+Response（创建支付订单）：
+```json
+{
+  "code": 0,
+  "data": {
+    "orderId": "order_xyz789",
+    "gateway": "wechat",
+    "paymentUrl": "weixin://...",
+    "expiresAt": "2026-03-30T15:00:00Z"  // 支付过期时间
+  }
+}
+```
+
+---
+
+#### GET /credits/balance（查询积分余额）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "balance": 485,
+    "locked": 50,
+    "available": 435,
+    "monthlyGrant": 500,
+    "monthlyUsed": 65,
+    "monthlyRemaining": 435
+  }
+}
+```
+
+---
+
+#### GET /credits/flow（积分明细）
+
+Query Parameters：
+- `page`（默认1）
+- `pageSize`（默认20）
+- `type`（可选）：subscribe / purchase / consume / refund
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {
+        "id": 1024,
+        "type": "consume",
+        "amount": -50,
+        "balanceAfter": 485,
+        "jobId": "job_abc123",
+        "description": "视频生成：episode_01.mp4（8个分镜）",
+        "createdAt": "2026-03-30T14:00:00Z"
+      },
+      {
+        "id": 1023,
+        "type": "subscribe",
+        "amount": 500,
+        "balanceAfter": 535,
+        "description": "购买创作档月套餐",
+        "createdAt": "2026-03-01T10:00:00Z"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 20,
+      "total": 156,
+      "totalPages": 8
+    }
+  }
+}
+```
+
+---
+
+#### POST /credits/purchase（购买积分包）
+
+Request：
+```json
+{
+  "package": "100",  // '100' | '500' | '1000'
+  "gateway": "wechat"
+}
+```
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "orderId": "order_credits_456",
+    "gateway": "wechat",
+    "amount": 9.9,
+    "credits": 100,
+    "paymentUrl": "weixin://..."
+  }
+}
+```
+
+---
+
+### 14.4 工作流 API（核心）
+
+#### POST /workflow/start（启动全自动 Pipeline）
+
+Request：
+```json
+{
+  "projectId": 123,
+  "novelId": 456,
+  "styleId": "ancient-sweet",
+  "resolution": "1080p",
+  "enableTTS": true,
+  "ttsVoice": "female_warm",
+  "bgmStyle": "warm",
+  "chapters": [1, 2],  // 选中的章节，null则全部
+  "autoProgress": true
+}
+```
+
+Response（202 Accepted）：
+```json
+{
+  "code": 0,
+  "data": {
+    "jobId": "job_abc123",
+    "taskId": 789,
+    "estimatedSeconds": 900,
+    "stages": [
+      { "index": 0, "name": "解析小说", "progress": 0 },
+      { "index": 1, "name": "生成剧本", "progress": 0 },
+      { "index": 2, "name": "生成分镜", "progress": 0 },
+      { "index": 3, "name": "生成视频", "progress": 0 },
+      { "index": 4, "name": "后处理", "progress": 0 }
+    ],
+    "websocketUrl": "wss://api.dramastory.ai/ws?jobId=job_abc123&token=..."
+  }
+}
+```
+
+错误响应：
+```json
+// 积分不足（402）
+{
+  "code": 30001,
+  "message": "积分不足，当前需要约 150 积分",
+  "data": { "required": 150, "balance": 50 }
+}
+
+// 套餐权限不足（403）
+{
+  "code": 30002,
+  "message": "当前套餐不支持 1080P 输出，请升级到创作档"
+}
+
+// 项目不存在（404）
+{
+  "code": 20001,
+  "message": "项目不存在或无权访问"
+}
+
+// 任务重复（409）
+{
+  "code": 40004,
+  "message": "该项目已有正在执行的任务，请等待完成",
+  "data": { "existingJobId": "job_existing" }
+}
+```
+
+---
+
+#### GET /workflow/status/:jobId（查询任务状态）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "jobId": "job_abc123",
+    "taskId": 789,
+    "status": "processing",
+    "stage": "video-generation",
+    "stageName": "生成视频",
+    "progress": 65,
+    "message": "正在生成第 5/8 个分镜...",
+    "attempts": 0,
+    "createdAt": "2026-03-30T14:00:00Z",
+    "startedAt": "2026-03-30T14:00:30Z",
+    "stages": [
+      { "index": 0, "name": "解析小说", "status": "completed", "duration": 8 },
+      { "index": 1, "name": "生成剧本", "status": "completed", "duration": 45 },
+      { "index": 2, "name": "生成分镜", "status": "completed", "duration": 120 },
+      { "index": 3, "name": "生成视频", "status": "processing", "progress": 65, "current": "fragment_5_8" },
+      { "index": 4, "name": "后处理", "status": "pending" }
+    ],
+    "result": null
+  }
+}
+```
+
+**任务完成时**：
+```json
+{
+  "code": 0,
+  "data": {
+    "jobId": "job_abc123",
+    "status": "completed",
+    "progress": 100,
+    "stage": "completed",
+    "result": {
+      "workId": 999,
+      "videoUrl": "https://cos.xxx/videos/123/episode_01.mp4",
+      "thumbnail": "https://cos.xxx/videos/123/episode_01_thumb.jpg",
+      "duration": 90,
+      "resolution": "1080p",
+      "watermark": false,
+      "qualityScore": 85
+    }
+  }
+}
+```
+
+**任务失败时**：
+```json
+{
+  "code": 0,
+  "data": {
+    "jobId": "job_abc123",
+    "status": "failed",
+    "stage": "video-generation",
+    "error": "AI 模型调用超时，已重试 3 次仍失败",
+    "canRetry": true,
+    "retryAt": "2026-03-30T15:00:00Z"
+  }
+}
+```
+
+---
+
+#### POST /workflow/cancel/:jobId（取消任务）
+
+Response：
+```json
+{
+  "code": 0,
+  "message": "任务已取消"
+}
+```
+
+**限制**：仅当 status 为 `pending` 或 `processing` 时可取消，`completed` 状态不可取消。
+
+---
+
+#### GET /tasks（我的任务列表）
+
+Query Parameters：
+- `page`（默认1）
+- `pageSize`（默认20）
+- `status`（可选）：pending / processing / completed / failed
+- `type`（可选）：pipeline / video / postprocess / batch
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {
+        "jobId": "job_abc123",
+        "taskId": 789,
+        "projectId": 123,
+        "projectTitle": "第一章 穿越",
+        "type": "pipeline",
+        "status": "processing",
+        "stage": "video-generation",
+        "progress": 65,
+        "style": "ancient-sweet",
+        "resolution": "1080p",
+        "createdAt": "2026-03-30T14:00:00Z",
+        "completedAt": null
+      },
+      {
+        "jobId": "job_xyz456",
+        "taskId": 788,
+        "projectId": 122,
+        "projectTitle": "甜宠日常",
+        "type": "pipeline",
+        "status": "completed",
+        "stage": "completed",
+        "progress": 100,
+        "style": "modern-sweet",
+        "resolution": "1080p",
+        "createdAt": "2026-03-29T10:00:00Z",
+        "completedAt": "2026-03-29T10:12:00Z",
+        "result": {
+          "workId": 998,
+          "thumbnail": "https://cos.xxx/..."
+        }
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 20,
+      "total": 45,
+      "totalPages": 3
+    }
+  }
+}
+```
+
+---
+
+### 14.5 作品管理 API
+
+#### GET /works（我的作品列表）
+
+Query Parameters：
+- `page`（默认1）
+- `pageSize`（默认20）
+- `public`（可选）：true / false
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {
+        "workId": 999,
+        "projectId": 123,
+        "projectTitle": "第一章 穿越",
+        "videoUrl": "https://cos.xxx/videos/123/episode_01.mp4",
+        "thumbnail": "https://cos.xxx/videos/123/episode_01_thumb.jpg",
+        "duration": 90,
+        "resolution": "1080p",
+        "style": "ancient-sweet",
+        "watermark": false,
+        "views": 1250,
+        "public": true,
+        "createdAt": "2026-03-30T14:12:00Z"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 20,
+      "total": 12,
+      "totalPages": 1
+    }
+  }
+}
+```
+
+---
+
+#### GET /works/:id（作品详情）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "workId": 999,
+    "projectId": 123,
+    "projectTitle": "第一章 穿越",
+    "styleId": "ancient-sweet",
+    "styleName": "古风甜宠",
+    "videoUrl": "https://cos.xxx/videos/123/episode_01.mp4",
+    "thumbnail": "https://cos.xxx/videos/123/episode_01_thumb.jpg",
+    "duration": 90,
+    "resolution": "1080p",
+    "watermark": false,
+    "views": 1250,
+    "public": true,
+    "taskId": 789,
+    "jobId": "job_abc123",
+    "qualityScore": 85,
+    "script": {
+      "title": "第一章 穿越",
+      "scenes": [
+        {
+          "sceneId": 1,
+          "location": "古代王府·书房",
+          "description": "主角坐在书桌前，神情凝重",
+          "dialogue": [
+            { "speaker": "林若雪", "text": "这王府里的人，个个都不简单。" }
+          ]
+        }
+      ]
+    },
+    "characters": [
+      {
+        "name": "林若雪",
+        "appearance": "25岁女性，鹅蛋脸...",
+        "referenceImage": "https://cos.xxx/..."
+      }
+    ],
+    "subtitles": {
+      "format": "srt",
+      "url": "https://cos.xxx/subtitles/123/episode_01.srt"
+    },
+    "createdAt": "2026-03-30T14:12:00Z"
+  }
+}
+```
+
+---
+
+#### PATCH /works/:id/visibility（修改可见性）
+
+Request：
+```json
+{
+  "public": true
+}
+```
+
+Response：
+```json
+{
+  "code": 0,
+  "message": "已设置为公开"
+}
+```
+
+---
+
+#### DELETE /works/:id（删除作品）
+
+Response：
+```json
+{
+  "code": 0,
+  "message": "作品已删除"
+}
+```
+
+**说明**：删除后 COS 上的文件同步删除，不可恢复。
+
+---
+
+### 14.6 管理后台 API（Admin）
+
+#### GET /admin/users（用户列表）
+
+Query Parameters：
+- `page`（默认1）
+- `pageSize`（默认20）
+- `plan`（可选）
+- `status`（可选）
+- `keyword`（可选，邮箱/手机号搜索）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {
+        "userId": 42,
+        "email": "user@example.com",
+        "phone": "138****8888",
+        "plan": "creator",
+        "credits": 485,
+        "totalWorks": 12,
+        "totalTasks": 28,
+        "status": "active",
+        "createdAt": "2026-03-15T10:00:00Z",
+        "lastActiveAt": "2026-03-30T14:00:00Z"
+      }
+    ],
+    "pagination": { "page": 1, "pageSize": 20, "total": 1234, "totalPages": 62 }
+  }
+}
+```
+
+---
+
+#### GET /admin/stats（数据统计）
+
+Query Parameters：
+- `startDate`（必填，如 2026-03-01）
+- `endDate`（必填，如 2026-03-30）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "summary": {
+      "totalUsers": 1234,
+      "newUsersToday": 45,
+      "totalWorks": 5678,
+      "totalTasks": 8901,
+      "completedTasks": 8123,
+      "failedTasks": 778,
+      "avgTaskDuration": 840,
+      "pipelineSuccessRate": 0.823
+    },
+    "credits": {
+      "totalIssued": 250000,
+      "totalConsumed": 189500,
+      "totalPurchased": 125000
+    },
+    "plans": [
+      { "plan": "free", "count": 856 },
+      { "plan": "creator", "count": 312 },
+      { "plan": "pro", "count": 58 },
+      { "plan": "enterprise", "count": 8 }
+    ],
+    "dailyTrend": [
+      { "date": "2026-03-25", "newUsers": 38, "works": 45, "tasks": 67 },
+      { "date": "2026-03-26", "newUsers": 42, "works": 52, "tasks": 71 }
+    ],
+    "topStyles": [
+      { "styleId": "ancient-sweet", "count": 890 },
+      { "styleId": "modern-sweet", "count": 756 }
+    ]
+  }
+}
+```
+
+---
+
+#### GET /admin/ai-models（AI 模型列表）
+
+Response：
+```json
+{
+  "code": 0,
+  "data": {
+    "models": [
+      {
+        "id": 1,
+        "name": "gemini-2.0-flash",
+        "provider": "google",
+        "type": "llm",
+        "capabilities": ["script-generation", "outline-generation"],
+        "priority": 1,
+        "isEnabled": true,
+        "costPerCall": 0.001,
+        "todayCalls": 1234,
+        "todayCost": 1.23,
+        "successRate": 0.992
+      },
+      {
+        "id": 2,
+        "name": "doubao-pro",
+        "provider": "bytedance",
+        "type": "llm",
+        "capabilities": ["script-generation", "tts"],
+        "priority": 2,
+        "isEnabled": true,
+        "costPerCall": 0.0008,
+        "todayCalls": 567,
+        "todayCost": 0.45,
+        "successRate": 0.988
+      },
+      {
+        "id": 3,
+        "name": "seedance-2.0",
+        "provider": "seedance",
+        "type": "video",
+        "capabilities": ["video-generation"],
+        "priority": 1,
+        "isEnabled": true,
+        "costPerCall": 0.5,
+        "todayCalls": 234,
+        "todayCost": 117.0,
+        "successRate": 0.967
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### PATCH /admin/ai-models/:id（更新模型配置）
+
+Request：
+```json
+{
+  "isEnabled": true,
+  "priority": 2,
+  "config": {
+    "maxConcurrent": 5,
+    "timeout": 30000
+  }
+}
+```
+
+Response：
+```json
+{
+  "code": 0,
+  "message": "模型配置已更新"
+}
+```
+
+---
+
+### 14.7 WebSocket 推送
+
+**连接方式**：
+```
+wss://api.dramastory.ai/ws?token={accessToken}
+```
+
+**心跳**：客户端每 30s 发送 `ping`，服务端返回 `pong`，超过 60s 无心跳则断开连接。
+
+**消息格式（服务端 → 客户端）**：
+
+```typescript
+// 任务进度更新
+{
+  "type": "task:progress",
+  "jobId": "job_abc123",
+  "stage": "video-generation",
+  "progress": 65,
+  "message": "正在生成第 5/8 个分镜...",
+  "timestamp": "2026-03-30T14:05:00.000Z"
+}
+
+// 任务完成
+{
+  "type": "task:complete",
+  "jobId": "job_abc123",
+  "workId": 999,
+  "videoUrl": "https://cos.xxx/videos/123/episode_01.mp4",
+  "thumbnail": "https://cos.xxx/...",
+  "duration": 90,
+  "qualityScore": 85
+}
+
+// 任务失败
+{
+  "type": "task:failed",
+  "jobId": "job_abc123",
+  "stage": "video-generation",
+  "error": "AI 模型调用超时",
+  "canRetry": true,
+  "retryAt": "2026-03-30T15:00:00.000Z"
+}
+
+// 积分不足提醒（当剩余积分 < 50 时推送）
+{
+  "type": "credit:low",
+  "balance": 35,
+  "message": "积分即将耗尽，建议提前充值"
+}
+
+// 系统通知
+{
+  "type": "system:notice",
+  "title": "系统升级公告",
+  "content": "将于 3月31日 02:00-04:00 进行系统升级...",
+  "priority": "normal"
+}
+```
+
+**消息类型总表**：
+
+| type | 方向 | 说明 |
+|------|------|------|
+| task:progress | 服务端→客户端 | 任务进度更新 |
+| task:complete | 服务端→客户端 | 任务完成 |
+| task:failed | 服务端→客户端 | 任务失败 |
+| task:cancelled | 服务端→客户端 | 任务取消 |
+| credit:low | 服务端→客户端 | 积分不足提醒 |
+| system:notice | 服务端→客户端 | 系统通知 |
+| ping | 客户端→服务端 | 心跳 |
+| pong | 服务端→客户端 | 心跳响应 |
