@@ -858,3 +858,481 @@ Response:
 ---
 
 *本文档为后端详细设计初稿，待开发评审后迭代*
+---
+
+## 十、原有业务迁移方案（详细）
+
+### 10.1 迁移原则
+
+| 原则 | 说明 |
+|------|------|
+| **功能零丢失** | 现有 82 个路由的所有业务逻辑必须保留 |
+| **渐进迁移** | 先适配层（Adapter），再业务层，最后数据库层 |
+| **可回滚** | 每个迁移步骤完成后可回滚到迁移前状态 |
+| **隔离测试** | 迁移完成后先用测试账号验证，确认无误再开放 |
+
+### 10.2 现有模块分析
+
+| 现有模块 | 路由前缀 | 核心功能 | 迁移策略 |
+|---------|---------|---------|---------|
+| novel | `/novel/` | 小说上传/解析/章节管理 | **直接迁移** + 扩展 user_id |
+| outline | `/outline/` | 大纲生成（Agent）| **封装为 Adapter** + 接入 ModelRouter |
+| script | `/script/` | 剧本生成（Agent）| **封装为 Adapter** + 接入 ModelRouter |
+| storyboard | `/storyboard/` | 分镜管理/图生提示词 | **封装为 Adapter** + 接入 ModelRouter |
+| assets | `/assets/` | 素材生成/角色管理 | **封装为 Adapter** + 增加一致性管理 |
+| video | `/video/` | 视频生成（多模型）| **封装为 Adapter** + 扩展新视频模型 |
+| setting | `/setting/` | AI 模型配置 | **接入 ModelRouter**（核心）|
+| project | `/project/` | 项目管理 | **迁移** + user_id + 多租户隔离 |
+| prompt | `/prompt/` | 提示词模板 | **迁移** + 扩展为风格模板 |
+| task | `/task/` | 任务管理 | **扩展** + 接入 TaskQueue |
+
+### 10.3 路由迁移步骤
+
+**Step 1：目录重组（不动代码）**
+```
+原目录：
+  src/routes/novel/addNovel.ts
+  src/routes/novel/getNovel.ts
+  src/routes/outline/agentsOutline.ts
+
+迁移后：
+  src/modules/novel/routes/addNovel.ts
+  src/modules/novel/routes/getNovel.ts
+  src/modules/outline/routes/agentsOutline.ts
+
+  src/modules/novel/adapters/NovelAdapter.ts        ← 新增：适配 ModelRouter
+  src/modules/outline/adapters/OutlineAdapter.ts   ← 新增：封装现有 Agent
+  src/modules/script/adapters/ScriptAdapter.ts     ← 新增：封装现有 Agent
+```
+
+**Step 2：路由层面加中间件（不改 Handler）**
+- 所有现有路由在 `app.ts` 注册时外层包裹 `AuthMiddleware`（从 admin 账号改为 JWT 认证）
+- 所有消耗性路由（outline/script/storyboard/video）包裹 `CreditMiddleware`
+- **预期**：现有路由在加这两层中间件后，无需改动 Handler 代码即可支持多用户
+
+**Step 3：封装为 Adapter（扩展 ModelRouter）**
+```typescript
+// src/modules/outline/adapters/OutlineAdapter.ts
+
+export class OutlineAdapter implements IModelAdapter {
+  readonly name = 'toonflow-outline';
+  readonly provider = 'toonflow';
+  readonly capabilities = ['outline-generation'] as const;
+
+  // 复用现有 Agent 逻辑，包装为标准接口
+  async call(prompt: string, options?: CallOptions): Promise<ModelOutput> {
+    // 调用现有的 agents/outlineScript/index.ts
+    const agent = new OutlineScript(projectId);
+    const result = await agent.generate(prompt);
+    return {
+      content: result,
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, // 估算
+      latency: 0
+    };
+  }
+}
+```
+
+**Step 4：数据层迁移（user_id 关联）**
+- 所有现有表（t_project / t_novel / t_outline 等）通过 `user_id` 字段关联到 `users` 表
+- 迁移脚本：创建 `user_id` 列，存量数据暂时设为 `1`（对应 admin 用户），新数据从认证获取
+
+### 10.4 迁移检查清单
+
+每个模块迁移完成后验证：
+
+- [ ] 路由响应格式不变（与迁移前一致）
+- [ ] 数据库写入正常（数据可查询）
+- [ ] JWT 认证生效（非 admin 账号可正常访问）
+- [ ] 积分扣减生效（消耗性操作正确扣积分）
+- [ ] WebSocket 推送正常（进度通知）
+- [ ] 现有前端（Toonflow-web）调用不受影响
+
+---
+
+## 十一、数据库改造详细方案
+
+### 11.1 现有表改造（Migration）
+
+**原则**：现有数据不丢失，通过 ALTER TABLE 扩展，不DROP/DELETE任何列。
+
+#### t_project（项目管理）
+
+```sql
+-- 新增字段
+ALTER TABLE t_project ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE t_project ADD COLUMN plan VARCHAR(20) NOT NULL DEFAULT 'free';
+ALTER TABLE t_project ADD COLUMN settings JSONB;
+ALTER TABLE t_project ADD COLUMN created_by INTEGER REFERENCES users(id);
+ALTER TABLE t_project ADD COLUMN updated_by INTEGER REFERENCES users(id);
+ALTER TABLE t_project ADD COLUMN deleted_at TIMESTAMP;  -- 软删除
+
+-- 创建索引（支持多租户查询）
+CREATE INDEX idx_project_user_id ON t_project(user_id);
+
+-- 迁移数据：存量项目关联到 admin 用户（id=1）
+UPDATE t_project SET user_id = 1 WHERE user_id IS NULL;
+```
+
+#### t_novel（小说管理）
+
+```sql
+ALTER TABLE t_novel ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE t_novel ADD COLUMN title VARCHAR(500);
+ALTER TABLE t_novel ADD COLUMN word_count INTEGER;
+ALTER TABLE t_novel ADD COLUMN status VARCHAR(20) DEFAULT 'active';  -- active/draft/archived
+ALTER TABLE t_novel ADD COLUMN created_by INTEGER REFERENCES users(id);
+ALTER TABLE t_novel ADD COLUMN deleted_at TIMESTAMP;
+
+CREATE INDEX idx_novel_user_id ON t_novel(user_id);
+UPDATE t_novel SET user_id = 1 WHERE user_id IS NULL;
+```
+
+#### t_outline / t_script / t_storyboard / t_assets / t_video
+
+```sql
+-- 统一操作（每个表）
+ALTER TABLE {TABLE} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE {TABLE} ADD COLUMN created_by INTEGER REFERENCES users(id);
+ALTER TABLE {TABLE} ADD COLUMN deleted_at TIMESTAMP;
+CREATE INDEX idx_{TABLE}_user_id ON {TABLE}(user_id);
+UPDATE {TABLE} SET user_id = 1 WHERE user_id IS NULL;
+```
+
+#### t_config（AI 模型配置）
+
+```sql
+-- 扩展字段支持多厂商
+ALTER TABLE t_config ADD COLUMN provider VARCHAR(50);  -- 'google', 'bytedance', 'seedance', 'openrouter'...
+ALTER TABLE t_config ADD COLUMN capabilities JSONB;   -- ['script-generation', 'character-analysis']
+ALTER TABLE t_config ADD COLUMN cost_per_call DECIMAL(10,2) DEFAULT 0;
+ALTER TABLE t_config ADD COLUMN priority INTEGER DEFAULT 100;  -- 优先级，数字越小越优先
+ALTER TABLE t_config ADD COLUMN is_enabled BOOLEAN DEFAULT true;
+
+-- 保留现有 config 字段（JSON 格式兼容新字段）
+-- 迁移时：provider = 'google'（根据 model 字段推断），capabilities 从 config.JSONB 解析
+```
+
+### 11.2 新增表（Create）
+
+详见 6.1 节，核心新增 8 张表：
+- users（用户）
+- plans（套餐）
+- subscriptions（订阅）
+- credits（积分）
+- credit_flow（积分流水）
+- tasks（任务）
+- payments（支付）
+- works（作品）
+
+### 11.3 迁移执行计划
+
+```
+Phase 1（数据准备）：
+  1. 创建 t_users 表，插入 admin 用户（id=1，作为存量数据默认用户）
+  2. 创建 plans 表，插入 4 个初始套餐
+  3. 批量 ALTER 所有现有表（加 user_id + created_by + deleted_at）
+
+Phase 2（功能适配）：
+  4. 所有现有表存量数据 user_id 设为 1（admin）
+  5. 修改 src/routes/ 所有 Handler，自动从 JWT 解密 userId，写入 user_id 字段
+
+Phase 3（积分关联）：
+  6. 新增 credits / credit_flow 表
+  7. 给 admin 用户预置积分（测试用）
+  8. CreditMiddleware 接入所有消耗性路由
+```
+
+---
+
+## 十二、第一阶段任务详细说明
+
+> 以下为 MVP 阶段（6-8 周）必须完成的全部任务，按优先级排序。
+
+### 任务列表
+
+| # | 任务名称 | 工作量 | 依赖 | 说明 |
+|---|---------|-------|------|------|
+| T1 | 数据库迁移 | 中 | 无 | SQLite → PostgreSQL，迁移脚本 |
+| T2 | 用户认证模块 | 大 | T1 | 注册/登录/微信/JWT |
+| T3 | 订阅积分系统 | 大 | T1+T2 | 套餐/积分/扣减/充值 |
+| T4 | 中间件层 | 中 | T2 | Auth/Billing/RateLimit/Logger |
+| T5 | AI 模型路由（扩展）| 中 | 无 | 接入豆包/Seedance/OpenRouter |
+| T6 | Workflow 编排层 | 大 | T4+T5 | Pipeline 串联 + 状态机 |
+| T7 | 任务队列（BullMQ）| 中 | T1 | 入队/进度/中断恢复 |
+| T8 | 质检节点 | 中 | T5 | 剧本/分镜/图片/视频质检 |
+| T9 | 后处理服务 | 大 | T7 | FFmpeg拼接+字幕+配音+BGM |
+| T10 | 通知推送（WebSocket）| 中 | T7 | 实时进度 + 完成通知 |
+| T11 | 原有路由迁移 | 大 | T1+T4 | 82个路由加中间件，user_id 关联 |
+| T12 | 前端适配 | 中 | T2+T11 | 登录/订阅/工作台改造 |
+
+### T9 详细说明：AI 配音（TTS）— 第一阶段任务
+
+**为什么放在第一阶段**：配音对完播率影响极大，是成品质量的关键差异点，且火山引擎 TTS 接入简单，ROI 高。
+
+**技术方案**：
+```typescript
+// src/shared/ai/adapters/ByteDanceTTSAdapter.ts
+
+export class ByteDanceTTSAdapter implements IModelAdapter {
+  readonly name = 'bytedance-tts';
+  readonly provider = 'bytedance';
+  readonly capabilities = ['tts'] as const;
+
+  async call(prompt: string, options?: TTSOptions): Promise<TTSOutput> {
+    // 调用火山引擎 TTS API
+    // 输入：对白文本列表 [{ text, speaker }]
+    // 输出：音频 Buffer 列表
+  }
+}
+
+// 支持音色（按风格）：
+// - female_warm（温暖女声）
+// - male_warm（温暖男声）
+// - female_bright（知性女声）
+// - male_deep（低沉男声）
+// - female_lively（活泼女声）
+```
+
+**接入位置**：PostProcessService（Step 4: AI 配音）
+
+**计费**：每1000字 = 10 积分（成本约 ¥0.01/千字）
+
+---
+
+## 十三、可观测性 & DFX 设计
+
+> DFX（Design for X）：包括可维护性、可排障性、可扩展性。
+
+### 13.1 日志体系
+
+**日志级别**：
+```
+DEBUG：  详细调试信息（开发环境自动开启，生产环境按需开启）
+INFO：   正常业务流程（请求入口/出口、任务开始/完成）
+WARN：   异常但不阻断（积分不足自动补、模型调用失败自动切换）
+ERROR：  错误需关注（数据库写入失败、AI API 超时、质检连续失败）
+FATAL：  系统不可用（服务崩溃、连接池耗尽）
+```
+
+**日志格式（JSON 结构化）**：
+```json
+{
+  "timestamp": "2026-03-30T14:30:00.000Z",
+  "level": "INFO",
+  "requestId": "req_abc123",
+  "userId": 42,
+  "jobId": "job_xyz789",
+  "module": "workflow",
+  "stage": "video-generation",
+  "message": "分镜 3/8 视频生成完成",
+  "duration": 12500,
+  "meta": {
+    "model": "seedance-2.0",
+    "fragmentIndex": 3,
+    "totalFragments": 8
+  }
+}
+```
+
+**关键日志埋点（必须）**：
+- 每个中间件入口/出口
+- 每个 Workflow Stage 开始/结束
+- AI 模型调用（请求 + 响应 + 耗时 + token 消耗）
+- 积分扣减（扣了多少、剩余多少）
+- 错误发生时的完整上下文
+
+### 13.2 异常自动处理
+
+#### 分层异常处理策略
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      异常分类与处理                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  L1: AI 模型调用异常                                        │
+│  ├─ 超时（>30s）→ 自动切换备选模型 + 重试（最多3次）          │
+│  ├─ 限流（429）→ 等待指数退避（1s, 2s, 4s）后重试            │
+│  ├─ 额度不足 → 切换下一个模型，记录切换原因                  │
+│  └─ 网络错误 → 记录 + 重试（3次），仍失败则标记任务失败        │
+│                                                             │
+│  L2: 质检未通过                                              │
+│  ├─ 自动重写（最多3次，参考 QualityService.autoRewrite）    │
+│  └─ 3次仍失败 → 暂停任务，通知用户手动确认                  │
+│                                                             │
+│  L3: 任务执行异常                                            │
+│  ├─ 未捕获异常 → 写入 t_tasks.error + 推送 task:failed       │
+│  ├─ 任务中断（服务重启）→ BullMQ 持久化 job，重启后自动恢复   │
+│  └─ 重复任务检测（同一 userId + projectId 同时只能有1个任务） │
+│                                                             │
+│  L4: 系统资源异常                                            │
+│  ├─ Redis 连接失败 → 降级为内存队列（单实例有限支持）         │
+│  ├─ PostgreSQL 连接失败 → 服务不可用，返回 503               │
+│  └─ COS 上传失败 → 重试3次，仍失败则任务标记失败并通知用户   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 重试策略配置
+
+```typescript
+// src/shared/infrastructure/retry.ts
+
+export const retryConfig = {
+  aiModelCall: {
+    maxAttempts: 3,
+    backoffMs: [1000, 2000, 4000],  // 指数退避
+    retryableErrors: ['ETIMEDOUT', 'ECONNRESET', '429', '503']
+  },
+  databaseWrite: {
+    maxAttempts: 2,
+    backoffMs: [100, 500],
+    retryableErrors: ['ECONNREFUSED', 'lock_timeout']
+  },
+  storageUpload: {
+    maxAttempts: 3,
+    backoffMs: [500, 1000, 2000],
+    retryableErrors: ['NetworkingError', 'RequestTimeout']
+  },
+  taskQueue: {
+    maxAttempts: 3,
+    backoffMs: [2000, 5000, 10000],
+    retryableErrors: ['Worker crashed', 'Job expired']
+  }
+};
+```
+
+### 13.3 分布式追踪
+
+**Request ID 全链路传递**：
+```typescript
+// 每个请求生成唯一 requestId
+const requestId = req.headers['x-request-id'] || uuid();
+
+// 挂载到 req，后续所有日志和子操作都携带
+req.requestId = requestId;
+
+// 中间件中自动传播
+ctx.requestId = requestId;
+
+// AI 调用时注入到 meta
+const modelCall = await modelRouter.call(task, prompt, {
+  requestId,
+  userId: req.user.id,
+  jobId
+});
+```
+
+**Span 结构**（与 OpenTelemetry 兼容）：
+```
+Request: /workflow/start
+  └─ Stage: video-generation [2.3s]
+       ├─ Model: seedance-2.0 [1.8s]
+       │   └─ HTTP: POST api.seedance.io [1.7s]
+       ├─ Quality: image-check [0.3s]
+       └─ Storage: upload [0.2s]
+  └─ Stage: postprocess [1.1s]
+       ├─ FFmpeg: concat [0.5s]
+       ├─ TTS: generate [0.4s]
+       └─ Storage: upload [0.2s]
+```
+
+### 13.4 监控指标（SLO）
+
+| 指标 | 目标 | 告警阈值 |
+|------|------|---------|
+| API 响应时间 P99 | < 2s | > 5s |
+| Pipeline 成功率 | > 80% | < 70% |
+| AI 模型调用成功率 | > 95% | < 90% |
+| 任务完成平均时长 | < 15min（不含排队）| > 20min |
+| 系统可用性 | > 99.5% | < 99% |
+
+### 13.5 告警规则
+
+```yaml
+# alert-rules.yml（接入 Prometheus AlertManager）
+
+alerts:
+  - name: high_error_rate
+    condition: rate(errors_total[5m]) > 0.05
+    severity: critical
+    message: "5分钟内错误率超过 5%，请立即检查"
+
+  - name: pipeline_success_rate_low
+    condition: pipeline_success_rate < 0.70
+    severity: warning
+    message: "Pipeline 成功率低于 70%，AI 生成质量可能有问题"
+
+  - name: task_queue_backlog
+    condition: queue_size > 100
+    severity: warning
+    message: "任务队列积压超过 100 个，请检查 AI 服务商状态"
+
+  - name: credits_depleted
+    condition: credits_balance == 0
+    severity: info
+    message: "用户积分耗尽"
+
+  - name: ai_model_degraded
+    condition: model_success_rate{provider="seedance"} < 0.90
+    severity: warning
+    message: "Seedance 模型成功率低于 90%，建议切换备选"
+```
+
+### 13.6 故障排查指南
+
+**常见问题快速定位**：
+
+| 症状 | 检查路径 |
+|------|---------|
+| Pipeline 卡住不动 | t_tasks 表看 stage + error → 查看日志 requestId |
+| AI 生成失败 | 搜索 requestId + "Model call failed" → 定位具体模型 |
+| 积分扣减不对 | credit_flow 表查 userId + 时间范围 → 对照任务记录 |
+| 视频无声音 | 检查 PostProcessService Step 4（TTS）日志 |
+| WebSocket 不推送 | 检查用户在线状态 + Redis pub/sub 连接 |
+| 数据库写入慢 | 检查索引 idx_user_id 是否存在 + 查询计划 |
+
+**日志查询示例**（假设用 ELK）：
+```
+# 查某个任务的所有日志
+requestId:req_abc123
+
+# 查某个用户的所有操作
+userId:42 AND _timestamp:[2026-03-30T14:00 TO 2026-03-30T15:00]
+
+# 查 AI 模型调用失败
+module:ai AND level:ERROR AND message:"Model call failed"
+
+# 查积分异常
+module:billing AND level:WARN
+```
+
+### 13.7 健康检查接口
+
+```typescript
+// GET /health
+
+{
+  "status": "ok",  // 'ok' | 'degraded' | 'down'
+  "version": "1.0.0",
+  "uptime": 86400,
+  "checks": {
+    "database": { "status": "ok", "latency": 5 },
+    "redis": { "status": "ok", "latency": 2 },
+    "storage": { "status": "ok", "latency": 50 },
+    "queue": { "status": "ok", "size": 12 },
+    "ai_models": {
+      "google-gemini": { "status": "ok", "latency": 200 },
+      "seedance-2.0": { "status": "degraded", "latency": 8000 }
+    }
+  }
+}
+
+// 当任一 check 失败时，status 变为 'degraded'
+// 当 database 或 queue 失败时，status 变为 'down'（K8s 会重启 Pod）
+```
+
+---
+
+*本文档持续更新中*
