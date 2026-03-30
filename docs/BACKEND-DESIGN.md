@@ -860,99 +860,129 @@ Response:
 *本文档为后端详细设计初稿，待开发评审后迭代*
 ---
 
-## 十、原有业务迁移方案（详细）
+## 十、原有业务改造方案（详细）
 
-### 10.1 迁移原则
+> **说明**：现有代码尚未上线，没有数据迁移负担。设计改造的核心是在 PostgreSQL 上重新构建数据结构，同时**保持现有代码的业务逻辑完全不变**，只是在数据层和接口层做适配扩展。
 
 | 原则 | 说明 |
 |------|------|
-| **功能零丢失** | 现有 82 个路由的所有业务逻辑必须保留 |
-| **渐进迁移** | 先适配层（Adapter），再业务层，最后数据库层 |
-| **可回滚** | 每个迁移步骤完成后可回滚到迁移前状态 |
-| **隔离测试** | 迁移完成后先用测试账号验证，确认无误再开放 |
+### 10.1 改造原则
 
-### 10.2 现有模块分析
+| 原则 | 说明 |
+|------|------|
+| **业务逻辑不变** | 现有 82 个路由的 Handler 逻辑直接保留，只改数据层和接口层 |
+| **数据重新建** | PostgreSQL 新建，SQLite 不迁移（无生产数据），按 PRD 业务需求重新设计表结构 |
+| **user_id 关联** | 原有表结构扩展 user_id 字段，用户认证后自动写入 |
+| **渐进测试** | 改造后用测试账号跑通全部 82 个路由，确认功能一致后再开放 |
 
-| 现有模块 | 路由前缀 | 核心功能 | 迁移策略 |
+### 10.2 现有模块分析与改造策略
+
+| 现有模块 | 路由前缀 | 核心功能 | 改造策略 |
 |---------|---------|---------|---------|
-| novel | `/novel/` | 小说上传/解析/章节管理 | **直接迁移** + 扩展 user_id |
-| outline | `/outline/` | 大纲生成（Agent）| **封装为 Adapter** + 接入 ModelRouter |
-| script | `/script/` | 剧本生成（Agent）| **封装为 Adapter** + 接入 ModelRouter |
-| storyboard | `/storyboard/` | 分镜管理/图生提示词 | **封装为 Adapter** + 接入 ModelRouter |
-| assets | `/assets/` | 素材生成/角色管理 | **封装为 Adapter** + 增加一致性管理 |
-| video | `/video/` | 视频生成（多模型）| **封装为 Adapter** + 扩展新视频模型 |
-| setting | `/setting/` | AI 模型配置 | **接入 ModelRouter**（核心）|
-| project | `/project/` | 项目管理 | **迁移** + user_id + 多租户隔离 |
-| prompt | `/prompt/` | 提示词模板 | **迁移** + 扩展为风格模板 |
-| task | `/task/` | 任务管理 | **扩展** + 接入 TaskQueue |
+| novel | `/novel/` | 小说上传/解析/章节管理 | **表重建** + user_id 关联 + 路由逻辑不变 |
+| outline | `/outline/` | 大纲生成（Agent）| **封装为 Adapter** + 接入 ModelRouter，路由逻辑不变 |
+| script | `/script/` | 剧本生成（Agent）| **封装为 Adapter** + 接入 ModelRouter，路由逻辑不变 |
+| storyboard | `/storyboard/` | 分镜管理/图生提示词 | **封装为 Adapter** + 接入 ModelRouter，路由逻辑不变 |
+| assets | `/assets/` | 素材生成/角色管理 | **扩展** + 增加一致性管理字段，路由逻辑不变 |
+| video | `/video/` | 视频生成（多模型）| **扩展** + 新视频模型适配，路由逻辑不变 |
+| setting | `/setting/` | AI 模型配置 | **接入 ModelRouter**（核心），新增管理接口 |
+| project | `/project/` | 项目管理 | **表重建** + user_id 关联 + 路由逻辑不变 |
+| prompt | `/prompt/` | 提示词模板 | **迁移** + 扩展为风格模板系统 |
+| task | `/task/` | 任务管理 | **扩展** + 接入 TaskQueue，保留现有查询逻辑 |
 
-### 10.3 路由迁移步骤
+### 10.3 代码层改造步骤
 
-**Step 1：目录重组（不动代码）**
+**Step 1：表重建（不动代码）**
+
+现有代码的 `better-sqlite3` 操作全部保留，在 PostgreSQL 上重新设计对应的表结构（user_id 关联 + 业务字段不变）。
+
+示例：t_project 表重建
+
+```sql
+-- PostgreSQL 重建 t_project（业务字段保持一致）
+CREATE TABLE t_project (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(200) NOT NULL,
+  description TEXT,
+  cover_image VARCHAR(500),
+  style VARCHAR(50),
+  status VARCHAR(20) DEFAULT 'active',
+  user_id INTEGER REFERENCES users(id),  -- 新增
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_project_user_id ON t_project(user_id);
 ```
-原目录：
-  src/routes/novel/addNovel.ts
-  src/routes/novel/getNovel.ts
-  src/routes/outline/agentsOutline.ts
 
-迁移后：
-  src/modules/novel/routes/addNovel.ts
-  src/modules/novel/routes/getNovel.ts
-  src/modules/outline/routes/agentsOutline.ts
+**Step 2：路由注册层加中间件（不改 Handler）**
 
-  src/modules/novel/adapters/NovelAdapter.ts        ← 新增：适配 ModelRouter
-  src/modules/outline/adapters/OutlineAdapter.ts   ← 新增：封装现有 Agent
-  src/modules/script/adapters/ScriptAdapter.ts     ← 新增：封装现有 Agent
-```
+所有现有路由在 `app.ts` 注册时外层包裹 `AuthMiddleware`（从单机 admin 改为 JWT 多用户）。
 
-**Step 2：路由层面加中间件（不改 Handler）**
-- 所有现有路由在 `app.ts` 注册时外层包裹 `AuthMiddleware`（从 admin 账号改为 JWT 认证）
-- 所有消耗性路由（outline/script/storyboard/video）包裹 `CreditMiddleware`
-- **预期**：现有路由在加这两层中间件后，无需改动 Handler 代码即可支持多用户
-
-**Step 3：封装为 Adapter（扩展 ModelRouter）**
 ```typescript
-// src/modules/outline/adapters/OutlineAdapter.ts
+// src/routes/project/addProject.ts（原有逻辑不变）
+// 只需在注册时外层包裹 AuthMiddleware：
 
-export class OutlineAdapter implements IModelAdapter {
-  readonly name = 'toonflow-outline';
-  readonly provider = 'toonflow';
-  readonly capabilities = ['outline-generation'] as const;
-
-  // 复用现有 Agent 逻辑，包装为标准接口
-  async call(prompt: string, options?: CallOptions): Promise<ModelOutput> {
-    // 调用现有的 agents/outlineScript/index.ts
-    const agent = new OutlineScript(projectId);
-    const result = await agent.generate(prompt);
-    return {
-      content: result,
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, // 估算
-      latency: 0
-    };
-  }
-}
+app.use('/project/add', AuthMiddleware, route_addProject);
+// 效果：req 中自动注入 req.user.id，Handler 内可通过 req.body.user_id 使用
 ```
 
-**Step 4：数据层迁移（user_id 关联）**
-- 所有现有表（t_project / t_novel / t_outline 等）通过 `user_id` 字段关联到 `users` 表
-- 迁移脚本：创建 `user_id` 列，存量数据暂时设为 `1`（对应 admin 用户），新数据从认证获取
+**Step 3：数据层适配（最小改动）**
 
-### 10.4 迁移检查清单
+原有 Handler 中的 `u.db()` 调用改为通过统一的 DB Client（兼容 SQLite 语法到 PostgreSQL）。
 
-每个模块迁移完成后验证：
+```typescript
+// src/utils/db.ts（新）
 
-- [ ] 路由响应格式不变（与迁移前一致）
-- [ ] 数据库写入正常（数据可查询）
+import knex from 'knex';
+
+export const db = knex({
+  client: 'pg',
+  connection: {
+    host: process.env.PG_HOST,
+    port: process.env.PG_PORT,
+    user: process.env.PG_USER,
+    password: process.env.PG_PASSWORD,
+    database: process.env.PG_DATABASE
+  },
+  pool: { min: 2, max: 10 }
+});
+
+// 原有代码的 u.db() 改为统一调用方式
+// 原有 SQL 语法（SELECT * FROM t_project WHERE id = ?）在新 DB Client 下完全兼容
+```
+
+**Step 4：扩展新功能（不破坏旧功能）**
+
+在现有表上新增字段，不修改现有字段名和类型。
+
+```sql
+-- 例：t_config 表新增 AI 模型厂商支持字段
+ALTER TABLE t_config ADD COLUMN provider VARCHAR(50);
+ALTER TABLE t_config ADD COLUMN capabilities JSONB;
+ALTER TABLE t_config ADD COLUMN cost_per_call DECIMAL(10,2);
+```
+
+### 10.4 改造检查清单
+
+每个模块改造完成后验证：
+
+- [ ] 数据库写入正常（数据可查询，与改造前一致）
 - [ ] JWT 认证生效（非 admin 账号可正常访问）
 - [ ] 积分扣减生效（消耗性操作正确扣积分）
 - [ ] WebSocket 推送正常（进度通知）
 - [ ] 现有前端（Toonflow-web）调用不受影响
+- [ ] 所有 82 个路由返回格式与改造前完全一致
 
 ---
 
 ## 十一、数据库改造详细方案
 
-### 11.1 现有表改造（Migration）
+> **说明**：现有代码尚未上线，无生产数据。数据库在 PostgreSQL 上**重新设计**，按 PRD 业务需求建表，不存在数据迁移。原有 SQLite 表结构作为参考，业务字段保留，新增多租户字段。
+
+### 11.1 现有表改造（PostgreSQL 重建）
+
+**原则**：表在 PostgreSQL 上重建（不迁移 SQLite 数据），业务字段保持一致，新增 user_id 等多租户字段。
 
 **原则**：现有数据不丢失，通过 ALTER TABLE 扩展，不DROP/DELETE任何列。
 
@@ -1025,23 +1055,27 @@ ALTER TABLE t_config ADD COLUMN is_enabled BOOLEAN DEFAULT true;
 - payments（支付）
 - works（作品）
 
-### 11.3 迁移执行计划
+### 11.3 改造执行计划
 
 ```
-Phase 1（数据准备）：
-  1. 创建 t_users 表，插入 admin 用户（id=1，作为存量数据默认用户）
+Phase 1（新建用户体系）：
+  1. 创建 t_users 表（无迁移，直接建）
   2. 创建 plans 表，插入 4 个初始套餐
-  3. 批量 ALTER 所有现有表（加 user_id + created_by + deleted_at）
+  3. 在各现有表（t_project/t_novel/t_outline/t_script/t_storyboard/t_assets/t_video）上 ADD COLUMN user_id
+  4. 在各现有表上 ADD COLUMN created_by / deleted_at，创建索引
 
-Phase 2（功能适配）：
-  4. 所有现有表存量数据 user_id 设为 1（admin）
-  5. 修改 src/routes/ 所有 Handler，自动从 JWT 解密 userId，写入 user_id 字段
+Phase 2（适配代码）：
+  5. 新增 DB Client（knex + pg），替换 better-sqlite3
+  6. 所有现有 Handler 中的 u.db() 调用保持不变（SQL 语法兼容）
+  7. 所有路由注册时外层包裹 AuthMiddleware，自动注入 user_id
 
 Phase 3（积分关联）：
-  6. 新增 credits / credit_flow 表
-  7. 给 admin 用户预置积分（测试用）
-  8. CreditMiddleware 接入所有消耗性路由
+  8. 新增 credits / credit_flow 表
+  9. CreditMiddleware 接入所有消耗性路由
+  10. 给测试用户预置积分
 ```
+
+**注意**：因无生产数据，无需 `UPDATE SET user_id = 1` 步骤。新用户操作时 user_id 直接从 JWT 获取。
 
 ---
 
